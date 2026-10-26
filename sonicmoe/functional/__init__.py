@@ -13,6 +13,7 @@ from quack.autotuner import AutotuneConfig
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import gemm, gemm_act, gemm_tuned
 
+from .. import tuning
 from ..enums import ActivationType, is_glu
 from .backward import (
     _down_projection_backward_act,
@@ -170,6 +171,9 @@ _gc._get_sm100_configs = _fast_sm100_configs
 # gemm_act / gemm_dact are built on first call and read the patched generators already.
 gemm_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
 
+# Per-GEMM tuning knobs (sonicmoe/tuning.py): bit-identical defaults; must chain onto the patches above.
+tuning.install()
+
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
@@ -257,22 +261,24 @@ class _UpProjection(torch.autograd.Function):
             else None
         )
 
-        gemm_act(
-            x,
-            w1.permute(2, 1, 0),
-            activation=activation_type.value,
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            preact_out=h,
-            postact_out=a,
-            store_preact=(not is_inference_mode_enabled),
-            bias=b1,
-            concat_layout=(
-                (("B", "bias") if b1 is not None else ("B",))
-                if concat_layout and is_glu_activation
-                else None
-            ),
-        )
+        with tuning.profile_range("up_act"):
+            gemm_act(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_type.value,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+                concat_layout=(
+                    (("B", "bias") if b1 is not None else ("B",))
+                    if concat_layout and is_glu_activation
+                    else None
+                ),
+                dynamic_scheduler=tuning.dynamic_scheduler("up_act"),
+            )
 
         ctx.T = T
         ctx.TK = TK
@@ -334,30 +340,33 @@ class _UpProjection(torch.autograd.Function):
             expert_frequency_offset=expert_frequency_offset,
             is_glu_activation=is_glu_activation,
             concat_layout=concat_layout,
+            dynamic_scheduler=tuning.dynamic_scheduler("dx"),
         )
 
-        gemm(
-            x.T,
-            dh,
-            out=dw1.permute(2, 1, 0),
-            cu_seqlens_k=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            batch_idx_permute=None,
-            dynamic_scheduler=False,
-            concat_layout=(("out",) if concat_layout else None),
-        )
+        with tuning.profile_range("dw1"):
+            gemm(
+                x.T,
+                dh,
+                out=dw1.permute(2, 1, 0),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=tuning.lpt_permute("dw1", expert_frequency_offset),
+                dynamic_scheduler=tuning.dynamic_scheduler("dw1"),
+                concat_layout=(("out",) if concat_layout else None),
+            )
 
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
 
-        _token_broadcast_backward(
-            dx_reduced=dx_reduced,
-            dx_expanded=dx_expanded,
-            s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_each_token_has_variable_activated_experts else K),
-            H=H,
-            is_varlen_K=is_each_token_has_variable_activated_experts,
-        )
+        with tuning.profile_range("dx_reduce"):
+            _token_broadcast_backward(
+                dx_reduced=dx_reduced,
+                dx_expanded=dx_expanded,
+                s_reverse_scatter_idx=s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+                varlen_K_max=(E if is_each_token_has_variable_activated_experts else K),
+                H=H,
+                is_varlen_K=is_each_token_has_variable_activated_experts,
+            )
 
         return dx_reduced, dw1, db1, *[None] * 13
 
@@ -386,21 +395,30 @@ class _DownProjection(torch.autograd.Function):
 
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
 
-        gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
+        with tuning.profile_range("down"):
+            gemm(
+                a,
+                w2.permute(2, 1, 0),
+                out=y,
+                cu_seqlens_m=expert_frequency_offset,
+                bias=b2,
+                dynamic_scheduler=tuning.dynamic_scheduler("down"),
+            )
 
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores = topk_scores.view(-1)
 
-        _router_forward(
-            y=y,
-            o=o,
-            topk_scores=topk_scores,
-            s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
-            H=H,
-            is_varlen_K=is_varlen_K,
-        )
+        with tuning.profile_range("combine"):
+            _router_forward(
+                y=y,
+                o=o,
+                topk_scores=topk_scores,
+                s_reverse_scatter_idx=s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+                varlen_K_max=(E if is_varlen_K else K),
+                H=H,
+                is_varlen_K=is_varlen_K,
+            )
 
         ctx.T = T
         ctx.K = K
@@ -460,17 +478,19 @@ class _DownProjection(torch.autograd.Function):
             x_gather_idx=x_gather_idx,
             s_scatter_idx=s_scatter_idx,
             activation_type=activation_type.value,
+            dynamic_scheduler=tuning.dynamic_scheduler("dact"),
         )
 
-        gemm(
-            dout.T,
-            a_prime,
-            out=dw2.permute(2, 0, 1),
-            cu_seqlens_k=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            batch_idx_permute=None,
-            dynamic_scheduler=False,
-        )
+        with tuning.profile_range("dw2"):
+            gemm(
+                dout.T,
+                a_prime,
+                out=dw2.permute(2, 0, 1),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=tuning.lpt_permute("dw2", expert_frequency_offset),
+                dynamic_scheduler=tuning.dynamic_scheduler("dw2"),
+            )
 
         # TC top-K routing
         if not is_varlen_K:
@@ -513,9 +533,10 @@ def moe_TC_softmax_topk_layer(
     expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
-    TC_topk_router_metadata_triton(
-        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
-    )
+    with tuning.profile_range("metadata"):
+        TC_topk_router_metadata_triton(
+            topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        )
 
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
@@ -602,18 +623,19 @@ def moe_general_routing_inputs(
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
     num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
 
-    general_routing_router_metadata_triton(
-        token_indices,
-        expert_indices,
-        T,
-        E,
-        expert_frequency,
-        expert_frequency_offset,
-        x_gather_idx,
-        s_scatter_idx,
-        s_reverse_scatter_idx,
-        num_activated_expert_per_token_offset,
-    )
+    with tuning.profile_range("metadata"):
+        general_routing_router_metadata_triton(
+            token_indices,
+            expert_indices,
+            T,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+        )
 
     a, h = _UpProjection.apply(
         x,

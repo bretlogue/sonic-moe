@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from quack.gemm_interface import gemm, gemm_dact
 
+from .. import tuning
 from ..enums import LIBRARY_NAME
 from ..utils import get_powers_of_2
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
@@ -179,19 +180,21 @@ def _up_projection_backward_act(
     expert_frequency_offset: torch.Tensor,
     is_glu_activation: bool,
     concat_layout: bool = False,
+    dynamic_scheduler: bool = False,
 ) -> None:
     I, H, E = w1.size()
     if is_glu_activation:
         I //= 2
 
-    gemm(
-        dh,
-        w1.permute(2, 0, 1),
-        cu_seqlens_m=expert_frequency_offset,
-        dynamic_scheduler=False,
-        out=dx_expanded,
-        concat_layout=(("B",) if concat_layout else None),
-    )
+    with tuning.profile_range("dx"):
+        gemm(
+            dh,
+            w1.permute(2, 0, 1),
+            cu_seqlens_m=expert_frequency_offset,
+            dynamic_scheduler=dynamic_scheduler,
+            out=dx_expanded,
+            concat_layout=(("B",) if concat_layout else None),
+        )
 
     # db1 computation
     if db1 is not None:
@@ -223,22 +226,23 @@ def _down_projection_backward_act(
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
     activation_type: str,
+    dynamic_scheduler: bool = False,
 ) -> None:
     s = topk_scores[s_scatter_idx]
-    _, _, ds_scattered = gemm_dact(
-        dout,
-        w2.permute(2, 0, 1),
-        PreAct=h,
-        activation=activation_type,
-        dx_out=dh,
-        postact_out=a_prime,
-        colvec_scale=s,
-        colvec_reduce=True,
-        cu_seqlens_m=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        dynamic_scheduler=False,
-    )
-    ds[s_scatter_idx] = ds_scattered
+    with tuning.profile_range("dact"):
+        _, _, ds_scattered = gemm_dact(
+            dout,
+            w2.permute(2, 0, 1),
+            PreAct=h,
+            activation=activation_type,
+            dx_out=dh,
+            postact_out=a_prime,
+            colvec_scale=s,
+            colvec_reduce=True,
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            dynamic_scheduler=dynamic_scheduler,
+        )
 
     if db2 is None:
         ds[s_scatter_idx] = ds_scattered
