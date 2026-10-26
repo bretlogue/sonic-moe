@@ -356,10 +356,17 @@ def dynamic_scheduler(role: str, default: bool = False) -> bool:
     return default if ov is None or ov.dynamic_scheduler is None else bool(ov.dynamic_scheduler)
 
 
-def lpt_permute(role: str, expert_frequency_offset: torch.Tensor) -> Optional[torch.Tensor]:
-    """``batch_idx_permute`` for a varlen-K GEMM: experts in descending row count, or None when off."""
+def lpt_enabled(role: str) -> bool:
     ov = _overrides.get(role)
-    if ov is None or not ov.lpt_permute:
+    return bool(ov is not None and ov.lpt_permute)
+
+
+def lpt_permutation(expert_frequency_offset: torch.Tensor) -> Optional[torch.Tensor]:
+    """The longest-first expert order (``batch_idx_permute``: experts by descending row count) when any dw
+    role asks for it, else None. Computed once per layer in the forward metadata step and saved for both
+    weight-gradient GEMMs: its three small kernels cost ~25 us each time, which on the backward critical path
+    of each dw call ate the order's gain at settled routing (H100 sb4/sb5, 2026-10-26)."""
+    if not any(lpt_enabled(role) for role in DW_ROLES):
         return None
     num_experts = expert_frequency_offset.shape[0] - 1
     # QuACK's kernel signature assumes the permutation's length is a multiple of 4 (make_fake_scheduler_args)
@@ -367,6 +374,11 @@ def lpt_permute(role: str, expert_frequency_offset: torch.Tensor) -> Optional[to
         return None
     counts = expert_frequency_offset[1:] - expert_frequency_offset[:-1]
     return torch.argsort(counts, descending=True, stable=True).to(torch.int32)
+
+
+def lpt_permute(role: str, expert_frequency_offset: torch.Tensor) -> Optional[torch.Tensor]:
+    """``batch_idx_permute`` for one dw role (None when that role's switch is off)."""
+    return lpt_permutation(expert_frequency_offset) if lpt_enabled(role) else None
 
 
 def profile_range(name: str):

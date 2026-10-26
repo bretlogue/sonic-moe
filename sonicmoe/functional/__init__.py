@@ -246,6 +246,7 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         concat_layout: bool = False,
+        lpt_perm: torch.Tensor | None = None,   # longest-first expert order for dW1 (tuning.lpt_permutation)
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -299,6 +300,7 @@ class _UpProjection(torch.autograd.Function):
             s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
+            lpt_perm,
         )
 
         ctx.mark_non_differentiable(a)
@@ -326,6 +328,7 @@ class _UpProjection(torch.autograd.Function):
             s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
+            lpt_perm,
         ) = ctx.saved_tensors
 
         dx_expanded = torch.empty(TK, H, dtype=dh.dtype, device=dh.device)
@@ -350,7 +353,7 @@ class _UpProjection(torch.autograd.Function):
                 out=dw1.permute(2, 1, 0),
                 cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
-                batch_idx_permute=tuning.lpt_permute("dw1", expert_frequency_offset),
+                batch_idx_permute=lpt_perm if tuning.lpt_enabled("dw1") else None,
                 dynamic_scheduler=tuning.dynamic_scheduler("dw1"),
                 concat_layout=(("out",) if concat_layout else None),
             )
@@ -389,6 +392,7 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        lpt_perm: torch.Tensor | None = None,   # longest-first expert order for dW2 (tuning.lpt_permutation)
     ) -> torch.Tensor:
         TK = a.size(0)
         H, I, E = w2.shape
@@ -433,6 +437,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
+            lpt_perm,
         )
 
         return o
@@ -452,6 +457,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
+            lpt_perm,
         ) = ctx.saved_tensors
 
         dw2 = torch.empty_like(w2)
@@ -488,7 +494,7 @@ class _DownProjection(torch.autograd.Function):
                 out=dw2.permute(2, 0, 1),
                 cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
-                batch_idx_permute=tuning.lpt_permute("dw2", expert_frequency_offset),
+                batch_idx_permute=lpt_perm if tuning.lpt_enabled("dw2") else None,
                 dynamic_scheduler=tuning.dynamic_scheduler("dw2"),
             )
 
@@ -496,7 +502,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dh, dw2, db2, ds, *[None] * 10
+        return None, dh, dw2, db2, ds, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -537,6 +543,7 @@ def moe_TC_softmax_topk_layer(
         TC_topk_router_metadata_triton(
             topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
         )
+        lpt_perm = tuning.lpt_permutation(expert_frequency_offset)
 
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
@@ -556,6 +563,7 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        lpt_perm,
     )
 
     o = _DownProjection.apply(
@@ -573,6 +581,7 @@ def moe_TC_softmax_topk_layer(
         None,
         False,  # is_each_token_has_variable_activated_expert
         activation_type,
+        lpt_perm,
     )
 
     return o, router_logits, expert_frequency
@@ -636,6 +645,7 @@ def moe_general_routing_inputs(
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
+        lpt_perm = tuning.lpt_permutation(expert_frequency_offset)
 
     a, h = _UpProjection.apply(
         x,
@@ -652,6 +662,7 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        lpt_perm,
     )
 
     o = _DownProjection.apply(
@@ -669,6 +680,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,  # is_each_token_has_variable_activated_expert
         activation_type,
+        lpt_perm,
     )
 
     return o, expert_frequency
