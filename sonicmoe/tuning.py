@@ -208,8 +208,7 @@ def _default_sm90_extras() -> list[ConfigSpec]:
             specs.append(ConfigSpec(128, n, None, False, cm, cn))                  # coop 128 (2 warpgroups x 64 rows)
         specs.append(ConfigSpec(128, n, None, True, 1, 1))                         # pingpong without a cluster
     # (128, 320) is NOT legal on SM90: one warpgroup's wgmma N is capped at 256 (a compile-time abort).
-    for cm, cn in ((2, 1), (1, 1)):
-        specs.append(ConfigSpec(320, 160, None, False, cm, cn))                    # M=1280 in four tiles, 2 WGs along N
+    # (320, 160), the four-tile M option, aborts inside CuTeDSL for these layouts (see sm90_spec_problem).
     for cm, cn in ((2, 1), (1, 1)):                                                # deeper K per pipeline stage
         specs.append(ConfigSpec(128, 160, 128, False, cm, cn))                     # (256-row tiles leave one stage)
         specs.append(ConfigSpec(128, 160, 128, True, cm, cn))
@@ -258,6 +257,11 @@ def sm90_spec_problem(spec: ConfigSpec) -> Optional[str]:
         elif not ((n % 16 == 0 and n <= 256) or (n % 32 == 0 and n <= 512)):
             return f"tile_n {n} must be a multiple of 16 up to 256 or of 32 up to 512"
     am, an = _sm90_atom_layout(spec)
+    if an == 2:
+        # Legal by GemmSm90.__init__'s rules, but the trace aborts the process (std::bad_variant_access) for every
+        # SonicMoE operand layout tried: sonic_compile_check for sm_90a, 2026-10-26 (320x160 both clusters, 192x160,
+        # 192x256; dw1, dw2 and dx). 192x128, which keeps one warpgroup along N, builds.
+        return f"tile_m {m} with tile_n {n} splits N across two warpgroups, which aborts inside CuTeDSL"
     mma_n = n // an
     if mma_n > 256 or mma_n % 8:
         return f"wgmma N {mma_n} (tile_n {n} over {an} warpgroup(s) along N) must be <= 256 and a multiple of 8"

@@ -164,11 +164,12 @@ class Sm90ShapeTest(TestCommons):
             self.assertIsNone(tuning.sm90_spec_problem(ConfigSpec.from_gemm_config(c)), tuning.describe(c))
 
     def test_known_good_and_bad_shapes(self):
-        ok = ["320x160 coop c2x1", "256x160 coop c1x1", "128x160 coop c2x1", "128x160x128 coop c2x1",
-              "128x160x128 pingpong c2x1", "128x208 pingpong c2x1", "64x256 pingpong c1x1"]
+        ok = ["256x160 coop c1x1", "128x160 coop c2x1", "128x160x128 coop c2x1", "192x128 coop c2x1",
+              "192x128 pingpong c2x1", "128x160x128 pingpong c2x1", "128x208 pingpong c2x1", "64x256 pingpong c1x1"]
         for s in ok:
             self.assertIsNone(tuning.sm90_spec_problem(ConfigSpec.parse(s)), s)
         bad = {"128x320 coop c2x1": "wgmma N", "256x160x128 coop c2x1": "pipeline stages", "256x320 coop c2x1": "wgmma N",
+               "320x160 coop c2x1": "two warpgroups", "192x160 coop c2x1": "two warpgroups", "192x256 coop c2x1": "two warpgroups",
                "128x224 pingpong c2x1": "<= 208", "256x192 pingpong c2x1": "pingpong needs tile_m", "320x192 coop c2x1": "<= 160",
                "128x160x40 coop c2x1": "multiple of 16", "256x160 coop c4x2": "at most 4 CTAs"}
         for s, why in bad.items():
