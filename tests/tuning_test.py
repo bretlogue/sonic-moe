@@ -156,6 +156,44 @@ class TuningSpecTest(TestCommons):
         self.assertIsNone(tuning.lpt_permute("dw1", off))
 
 
+class Sm90ShapeTest(TestCommons):
+    def test_default_space_passes(self):
+        import quack.gemm_config as gc
+
+        for c in tuning._default_space.get(9) or set(gc._get_sm90_configs()):
+            self.assertIsNone(tuning.sm90_spec_problem(ConfigSpec.from_gemm_config(c)), tuning.describe(c))
+
+    def test_known_good_and_bad_shapes(self):
+        ok = ["320x160 coop c2x1", "256x160 coop c1x1", "128x160 coop c2x1", "128x160x128 coop c2x1",
+              "128x160x128 pingpong c2x1", "128x208 pingpong c2x1", "64x256 pingpong c1x1"]
+        for s in ok:
+            self.assertIsNone(tuning.sm90_spec_problem(ConfigSpec.parse(s)), s)
+        bad = {"128x320 coop c2x1": "wgmma N", "256x160x128 coop c2x1": "pipeline stages", "256x320 coop c2x1": "wgmma N",
+               "128x224 pingpong c2x1": "<= 208", "256x192 pingpong c2x1": "pingpong needs tile_m", "320x192 coop c2x1": "<= 160",
+               "128x160x40 coop c2x1": "multiple of 16", "256x160 coop c4x2": "at most 4 CTAs"}
+        for s, why in bad.items():
+            problem = tuning.sm90_spec_problem(ConfigSpec.parse(s))
+            self.assertIsNotNone(problem, s)
+            self.assertIn(why, problem, s)
+
+    def test_invalid_override_is_skipped_with_a_warning(self):
+        import warnings as w
+        from quack.autotuner import AutotuneConfig
+        import quack.gemm_config as gc
+
+        tuning.set_overrides({"dw1": {"configs": ["128x320 coop c2x1", "256x160 coop c1x1"]}})
+        try:
+            space = [AutotuneConfig(config=c) for c in gc._get_sm90_configs()]
+            self.assertNotIn(ConfigSpec(128, 320, None, False, 2, 1).to_gemm_config(9), {c.kwargs["config"] for c in space})
+            with w.catch_warnings(record=True) as caught:
+                w.simplefilter("always")
+                kept = tuning._filter_for_role(space, "dw1", 9, "test")
+            self.assertEqual([tuning.describe(c.kwargs["config"]) for c in kept], ["256x160 coop c1x1"])
+            self.assertTrue(any("wgmma N" in str(x.message) for x in caught))
+        finally:
+            tuning.set_overrides(None)
+
+
 class TuningSpaceTest(TestCommons):
     """The autotune-space filter, exercised on the SM90 lists without a GPU."""
 
@@ -178,9 +216,9 @@ class TuningSpaceTest(TestCommons):
             self.assertEqual({c.kwargs["config"] for c in kept}, set(self.default), role)
 
     def test_override_restricts_to_listed_configs(self):
-        tuning.set_overrides({"dw1": {"configs": ["128x320 coop c2x1", "256x160 coop c2x1"]}})
+        tuning.set_overrides({"dw1": {"configs": ["128x160 coop c2x1", "256x160 coop c2x1"]}})
         kept = tuning._filter_for_role(self.space, "dw1", 9, "test")
-        self.assertEqual({tuning.describe(c.kwargs["config"]) for c in kept}, {"128x320 coop c2x1", "256x160 coop c2x1"})
+        self.assertEqual({tuning.describe(c.kwargs["config"]) for c in kept}, {"128x160 coop c2x1", "256x160 coop c2x1"})
         kept = tuning._filter_for_role(self.space, "dw2", 9, "test")
         self.assertEqual({c.kwargs["config"] for c in kept}, set(self.default))
 

@@ -207,16 +207,84 @@ def _default_sm90_extras() -> list[ConfigSpec]:
         for cm, cn in ((2, 1), (1, 1), (1, 2)):
             specs.append(ConfigSpec(128, n, None, False, cm, cn))                  # coop 128 (2 warpgroups x 64 rows)
         specs.append(ConfigSpec(128, n, None, True, 1, 1))                         # pingpong without a cluster
-    for cm, cn in ((2, 1), (1, 1), (1, 2)):
-        specs.append(ConfigSpec(128, 320, None, False, cm, cn))                    # N=640 in two tiles
+    # (128, 320) is NOT legal on SM90: one warpgroup's wgmma N is capped at 256 (a compile-time abort).
     for cm, cn in ((2, 1), (1, 1)):
-        specs.append(ConfigSpec(320, 160, None, False, cm, cn))                    # M=1280 in four tiles
+        specs.append(ConfigSpec(320, 160, None, False, cm, cn))                    # M=1280 in four tiles, 2 WGs along N
     for cm, cn in ((2, 1), (1, 1)):                                                # deeper K per pipeline stage
-        specs.append(ConfigSpec(256, 160, 128, False, cm, cn))
-        specs.append(ConfigSpec(128, 160, 128, False, cm, cn))
+        specs.append(ConfigSpec(128, 160, 128, False, cm, cn))                     # (256-row tiles leave one stage)
         specs.append(ConfigSpec(128, 160, 128, True, cm, cn))
-    specs.append(ConfigSpec(128, 320, 128, False, 2, 1))
     return specs
+
+
+# ---------------------------------------------------------------------------------------------
+# SM90 shape validity (a bad shape is a CuTeDSL compile error that aborts the process, not an inf timing)
+# ---------------------------------------------------------------------------------------------
+SM90_SMEM_BYTES = 227 * 1024
+_SM90_EPI_RESERVE_BYTES = 48 * 1024   # epilogue stages, barriers and alignment pads, roughly
+
+
+def _sm90_atom_layout(spec: ConfigSpec) -> tuple[int, int]:
+    """The warpgroup layout GemmSm90.__init__ derives from the tile (quack/gemm_sm90.py)."""
+    if spec.pingpong:
+        return 1, 1
+    if spec.tile_m == 320:
+        return 1, 2
+    if spec.tile_m == 192:
+        return (3, 1) if spec.tile_n <= 128 else (1, 2)
+    return (spec.tile_m // 64 if spec.tile_m < 256 else 2), 1
+
+
+def sm90_spec_problem(spec: ConfigSpec) -> Optional[str]:
+    """Why QuACK's SM90 kernel cannot be built for this spec, or None. Mirrors GemmSm90.__init__'s tile rules
+    and adds two it does not check up front: the per-warpgroup wgmma N must be <= 256 and a multiple of 8
+    (tile_n 320 with one warpgroup along N fails there, inside the compiler), and the A/B pipeline needs at
+    least two stages in the 227 KB of shared memory."""
+    m, n, k = spec.tile_m, spec.tile_n, spec.tile_k or 64
+    if k % 16:
+        return f"tile_k {k} is not a multiple of 16"
+    if spec.pingpong:
+        if m not in (64, 128, 192):
+            return f"pingpong needs tile_m 64, 128 or 192, got {m}"
+        n_max = 256 if m == 64 else (208 if m == 128 else 128)
+        if n % 16 or n > n_max:
+            return f"pingpong tile_m {m} needs tile_n % 16 == 0 and <= {n_max}, got {n}"
+    else:
+        if m not in (64, 128, 192, 256, 320):
+            return f"cooperative needs tile_m 64, 128, 192, 256 or 320, got {m}"
+        if m in (192, 320):
+            n_max = 256 if m == 192 else 160
+            if n % 32 or n > n_max:
+                return f"tile_m {m} needs tile_n % 32 == 0 and <= {n_max}, got {n}"
+        elif not ((n % 16 == 0 and n <= 256) or (n % 32 == 0 and n <= 512)):
+            return f"tile_n {n} must be a multiple of 16 up to 256 or of 32 up to 512"
+    am, an = _sm90_atom_layout(spec)
+    mma_n = n // an
+    if mma_n > 256 or mma_n % 8:
+        return f"wgmma N {mma_n} (tile_n {n} over {an} warpgroup(s) along N) must be <= 256 and a multiple of 8"
+    acc_regs = m * n // (am * an * 128)
+    if acc_regs > 232:
+        return f"{acc_regs} accumulator registers per thread exceed the cooperative budget of 232"
+    stage_bytes = (m + n) * k * 2
+    if (SM90_SMEM_BYTES - _SM90_EPI_RESERVE_BYTES) // stage_bytes < 2:
+        return f"{stage_bytes // 1024} KB per A/B stage leaves fewer than two pipeline stages"
+    if spec.cluster_m not in (1, 2, 4) or spec.cluster_n not in (1, 2, 4) or spec.cluster_m * spec.cluster_n > 4:
+        return "cluster dims must be 1, 2 or 4 with at most 4 CTAs"
+    return None
+
+
+_warned_specs: set = set()
+
+
+def _spec_usable(spec: ConfigSpec, cap: int, where: str) -> bool:
+    if cap != 9:
+        return True   # SM120's constraints are not modelled; the laptop only validates plumbing
+    why = sm90_spec_problem(spec)
+    if why is None:
+        return True
+    if (spec, where) not in _warned_specs:
+        _warned_specs.add((spec, where))
+        warnings.warn(f"sonicmoe.tuning: skipping {spec} for {where} on SM90: {why}", stacklevel=3)
+    return False
 
 
 # ---------------------------------------------------------------------------------------------
@@ -360,6 +428,8 @@ def _with_extras(original, cap: int):
             c = spec.to_gemm_config(cap)
             if c in base_set or c in extras:
                 continue
+            if not _spec_usable(spec, cap, "the config space"):
+                continue
             if epilogue == "gated" and (c.tile_n % 32 or c.tile_m == 192):
                 continue
             if epilogue in ("lse", "gated") and c.swap_ab:
@@ -379,13 +449,13 @@ def _refresh_spaces() -> None:
 def _filter_for_role(kept: list, role: Optional[str], cap: int, where: str) -> list:
     ov = _overrides.get(role) if role is not None else None
     if ov is not None and ov.configs:
-        wanted = {spec.to_gemm_config(cap) for spec in ov.configs}
+        wanted = {spec.to_gemm_config(cap) for spec in ov.configs if _spec_usable(spec, cap, f"role {role}")}
         chosen = [conf for conf in kept if conf.kwargs["config"] in wanted]
         if not chosen:
             raise ValueError(
-                f"sonicmoe.tuning: none of the configs listed for role {role!r} is valid for this {where} call "
-                f"({[str(s) for s in ov.configs]}); QuACK's structural checks (gather needs cluster_n=1, "
-                "varlen/gather forbid swap_ab) pruned them all"
+                f"sonicmoe.tuning: none of the configs listed for role {role!r} can run this {where} call "
+                f"({[str(s) for s in ov.configs]}): the arch's shape rules (see sm90_spec_problem) or QuACK's "
+                "structural checks (gather needs cluster_n=1, varlen/gather forbid swap_ab) removed them all"
             )
         return chosen
     extras = _extra_configs.get(cap)
