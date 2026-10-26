@@ -195,6 +195,29 @@ class Sm90ShapeTest(TestCommons):
             tuning.set_overrides(None)
 
 
+class OverrideTextTest(TestCommons):
+    def test_three_forms(self):
+        import tempfile
+
+        self.assertIsNone(tuning.load_overrides_text(""))
+        self.assertEqual(tuning.load_overrides_text('{"dw": {"lpt_permute": true}}'), {"dw": {"lpt_permute": True}})
+        with tempfile.TemporaryDirectory() as d:
+            plain = os.path.join(d, "ov.json")
+            with open(plain, "w") as f:
+                json.dump({"dx": {"dynamic_scheduler": True}}, f)
+            self.assertEqual(tuning.load_overrides_text(plain), {"dx": {"dynamic_scheduler": True}})
+            sweep = os.path.join(d, "sweep.json")
+            with open(sweep, "w") as f:
+                json.dump({"settings": [{"name": "default", "overrides": None},
+                                        {"name": "best", "overrides": {"all": {"dynamic_scheduler": True}}}]}, f)
+            self.assertEqual(tuning.load_overrides_text(sweep + ":best"), {"all": {"dynamic_scheduler": True}})
+            self.assertIsNone(tuning.load_overrides_text(sweep + ":default"))
+            with self.assertRaises(ValueError):
+                tuning.load_overrides_text(sweep + ":missing")
+            with self.assertRaises(ValueError):
+                tuning.load_overrides_text(sweep)
+
+
 class TuningSpaceTest(TestCommons):
     """The autotune-space filter, exercised on the SM90 lists without a GPU."""
 

@@ -341,14 +341,32 @@ def set_overrides(mapping: Optional[dict]) -> None:
             _refresh_spaces()
 
 
-def _load_env_overrides() -> Optional[dict]:
-    raw = os.environ.get(ENV_OVERRIDES, "").strip()
+def load_overrides_text(raw: str) -> Optional[dict]:
+    """SONICMOE_TUNING's three forms: inline JSON; a path to a JSON overrides file; or ``<sweep.json>:<name>``,
+    one named setting of a bench_sonic sweep file ({"settings": [{"name", "overrides"}, ...]})."""
+    raw = raw.strip()
     if not raw:
         return None
     if raw.startswith("{"):
         return json.loads(raw)
+    if ":" in raw and not os.path.exists(raw):
+        path, name = raw.rsplit(":", 1)
+        with open(path) as f:
+            data = json.load(f)
+        settings = data["settings"] if isinstance(data, dict) and "settings" in data else data
+        for setting in settings:
+            if setting.get("name") == name:
+                return setting.get("overrides")
+        raise ValueError(f"{ENV_OVERRIDES}: no setting named {name!r} in {path}")
     with open(raw) as f:
-        return json.load(f)
+        data = json.load(f)
+    if isinstance(data, dict) and "settings" in data:
+        raise ValueError(f"{ENV_OVERRIDES}: {raw} is a sweep file; name a setting as {raw}:<name>")
+    return data
+
+
+def _load_env_overrides() -> Optional[dict]:
+    return load_overrides_text(os.environ.get(ENV_OVERRIDES, ""))
 
 
 def dynamic_scheduler(role: str, default: bool = False) -> bool:
